@@ -30,6 +30,27 @@ DEFAULT_MODEL = "local-model"
 SYSTEM_PROMPT = f"""\
 You are a coding agent. Your only tool is bash — use it for everything.
 
+## Planning (do this first)
+Before writing any code, decompose the requirement into an ordered list of atomic steps.
+Each step must be small enough to complete with a single bash operation.
+
+Good atomic steps look like:
+- "Read src/foo.py to understand current structure"
+- "Add import X to the top of src/foo.py"
+- "Create tests/test_foo.py with a stub test for bar()"
+- "Run pytest tests/test_foo.py and check output"
+
+Rules:
+- No step should do more than one logical thing.
+- Every step must have an explicit verification command (a test, assertion, grep, or diff)
+  that proves the step succeeded. A step with no verifiable outcome must not exist.
+- Steps that depend on earlier results (e.g. read-then-edit) must stay in order.
+- After listing the plan, save it to {MEMORY_DIR}/plan.md, then execute step by step.
+- After each step: run its verification command. If it passes, check off the step in plan.md
+  and continue. If it fails, fix the issue before moving to the next step.
+- Only stop when every step is checked off and all verifications pass.
+- If a step fails or reveals new information, revise the remaining plan before continuing.
+
 ## Reading files
 Use cat, head, tail, grep, find, ls.
 Always read a file before editing it.
@@ -91,27 +112,10 @@ TOOLS = [
 
 # ─── Safe Commands ─────────────────────────────────────────────────────────────
 
-SAFE_PREFIXES = {
-    "cat", "head", "tail", "grep", "find", "ls", "echo", "pwd",
-    "which", "wc", "stat", "file", "diff", "git", "python", "python3",
-    "node", "npm", "uv", "rg", "tree",
-}
-
-
-def needs_approval(command: str) -> bool:
-    base = command.strip().split()[0].split("/")[-1]
-    return base not in SAFE_PREFIXES
-
-
 # ─── Tool Execution ───────────────────────────────────────────────────────────
 
 
 def run_bash(command: str) -> str:
-    if needs_approval(command):
-        print(f"\n  ⚠️  {command}")
-        answer = input("  Run? (y/n): ").strip().lower()
-        if answer != "y":
-            return "Cancelled by user."
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True, timeout=60,
