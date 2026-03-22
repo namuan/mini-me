@@ -2,295 +2,137 @@
 # /// script
 # dependencies = [
 #   "openai",
-#   "schedule",
 # ]
 # ///
 """
-mini-openclaw.py - A minimal OpenClaw clone.
+mini-me.py - A coding agent with a single bash tool.
 """
 
 import json
 import os
 import subprocess
 import threading
-import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-import schedule
 from openai import OpenAI
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 
-WORKSPACE = Path.cwd().joinpath(".mini-openclaw")
-SESSIONS_DIR = os.path.join(WORKSPACE, "sessions")
-MEMORY_DIR = os.path.join(WORKSPACE, "memory")
-APPROVALS_FILE = os.path.join(WORKSPACE, "exec-approvals.json")
+WORKSPACE = Path.cwd() / ".mini-me"
+SESSIONS_DIR = WORKSPACE / "sessions"
+MEMORY_DIR = WORKSPACE / "memory"
 
 BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_MODEL = "local-model"
 
-# ─── Agents ────────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = f"""\
+You are a coding agent. Your only tool is bash — use it for everything.
 
-AGENTS = {
-    "main": {
-        "name": "Jarvis",
-        "model": DEFAULT_MODEL,
-        "soul": (
-            "You are Jarvis, a personal AI assistant.\n"
-            "Be genuinely helpful. Skip the pleasantries. Have opinions.\n"
-            "You have tools — use them proactively.\n\n"
-            "## Memory\n"
-            f"Your workspace is {WORKSPACE}.\n"
-            "Use save_memory to store important information across sessions.\n"
-            "Use memory_search at the start of conversations to recall context."
-        ),
-        "session_prefix": "agent:main",
-    },
-    "researcher": {
-        "name": "Scout",
-        "model": DEFAULT_MODEL,
-        "soul": (
-            "You are Scout, a research specialist.\n"
-            "Your job: find information and cite sources. Every claim needs evidence.\n"
-            "Use tools to gather data. Be thorough but concise.\n"
-            "Save important findings with save_memory for other agents to reference."
-        ),
-        "session_prefix": "agent:researcher",
-    },
-}
+## File operations
+Read files with: cat, head, tail, grep, find, ls
+Write files with: tee, cp, mv, mkdir -p
+Edit files with: sed, awk, patch, or write full replacements via tee
 
-# ─── Tools ─────────────────────────────────────────────────────────────────────
+## Memory
+Your persistent memory lives in {MEMORY_DIR}.
+- Save: echo "..." | tee {MEMORY_DIR}/<key>.md
+- Load: cat {MEMORY_DIR}/<key>.md
+- List: ls {MEMORY_DIR}/
+At the start of each conversation, load relevant memory files to recall context.
+
+## Working style
+- Always read existing code before modifying it.
+- Run tests or linters after changes when available.
+- Prefer small, focused changes over large rewrites.
+- When stuck, inspect the actual error output — don't guess.
+"""
+
+# ─── Tool ──────────────────────────────────────────────────────────────────────
 
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "run_command",
-            "description": "Run a shell command",
+            "name": "bash",
+            "description": "Run a bash command. Use this for all file I/O, code edits, tests, and memory operations.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The command to run"}
+                    "command": {"type": "string", "description": "The bash command to run"},
                 },
                 "required": ["command"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a file from the filesystem",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to the file"}
-                },
-                "required": ["path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "Write content to a file (creates directories if needed)",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Path to the file"},
-                    "content": {"type": "string", "description": "Content to write"},
-                },
-                "required": ["path", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "save_memory",
-            "description": "Save important information to long-term memory",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "key": {
-                        "type": "string",
-                        "description": "Short label (e.g. 'user-preferences')",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The information to remember",
-                    },
-                },
-                "required": ["key", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "memory_search",
-            "description": "Search long-term memory for relevant information",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "What to search for"}
-                },
-                "required": ["query"],
-            },
-        },
-    },
+    }
 ]
 
-# ─── Permission Controls ──────────────────────────────────────────────────────
+# ─── Safe Commands ─────────────────────────────────────────────────────────────
 
-SAFE_COMMANDS = {
-    "ls",
-    "cat",
-    "head",
-    "tail",
-    "wc",
-    "date",
-    "whoami",
-    "echo",
-    "pwd",
-    "which",
-    "git",
-    "python",
-    "node",
-    "npm",
+SAFE_PREFIXES = {
+    "cat", "head", "tail", "grep", "find", "ls", "echo", "pwd",
+    "which", "wc", "stat", "file", "diff", "git", "python", "python3",
+    "node", "npm", "uv", "rg", "tree",
 }
 
 
-def load_approvals():
-    """Load persistent command approvals from disk."""
-    if os.path.exists(APPROVALS_FILE):
-        with open(APPROVALS_FILE) as f:
-            return json.load(f)
-    return {"allowed": [], "denied": []}
-
-
-def save_approval(command, approved):
-    """Store user approval decision."""
-    approvals = load_approvals()
-    key = "allowed" if approved else "denied"
-    if command not in approvals[key]:
-        approvals[key].append(command)
-    with open(APPROVALS_FILE, "w") as f:
-        json.dump(approvals, f, indent=2)
-
-
-def check_command_safety(command):
-    """Determine if a command can run immediately."""
-    base_cmd = command.strip().split()[0] if command.strip() else ""
-    if base_cmd in SAFE_COMMANDS:
-        return "safe"
-    approvals = load_approvals()
-    if command in approvals["allowed"]:
-        return "approved"
-    return "needs_approval"
+def needs_approval(command: str) -> bool:
+    base = command.strip().split()[0].split("/")[-1]
+    return base not in SAFE_PREFIXES
 
 
 # ─── Tool Execution ───────────────────────────────────────────────────────────
 
 
-def execute_tool(name, tool_input):
-    """Execute a tool and return its output as a string."""
-    if name == "run_command":
-        cmd = tool_input["command"]
-        safety = check_command_safety(cmd)
-        if safety == "needs_approval":
-            print(f"\n  ⚠️  Command: {cmd}")
-            confirm = input("  Allow? (y/n): ").strip().lower()
-            if confirm != "y":
-                save_approval(cmd, False)
-                return "Permission denied by user."
-            save_approval(cmd, True)
-        try:
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=30
-            )
-            output = result.stdout + result.stderr
-            return output if output else "(no output)"
-        except subprocess.TimeoutExpired:
-            return "Command timed out after 30 seconds"
-        except Exception as e:
-            return f"Error: {e}"
-
-    elif name == "read_file":
-        try:
-            with open(tool_input["path"], "r") as f:
-                return f.read()[:10000]
-        except Exception as e:
-            return f"Error: {e}"
-
-    elif name == "write_file":
-        try:
-            os.makedirs(os.path.dirname(tool_input["path"]) or ".", exist_ok=True)
-            with open(tool_input["path"], "w") as f:
-                f.write(tool_input["content"])
-            return f"Wrote to {tool_input['path']}"
-        except Exception as e:
-            return f"Error: {e}"
-
-    elif name == "save_memory":
-        os.makedirs(MEMORY_DIR, exist_ok=True)
-        filepath = os.path.join(MEMORY_DIR, f"{tool_input['key']}.md")
-        with open(filepath, "w") as f:
-            f.write(tool_input["content"])
-        return f"Saved to memory: {tool_input['key']}"
-
-    elif name == "memory_search":
-        query = tool_input["query"].lower()
-        results = []
-        if os.path.exists(MEMORY_DIR):
-            for fname in os.listdir(MEMORY_DIR):
-                if fname.endswith(".md"):
-                    with open(os.path.join(MEMORY_DIR, fname), "r") as f:
-                        content = f.read()
-                    if any(w in content.lower() for w in query.split()):
-                        results.append(f"--- {fname} ---\n{content}")
-        return "\n\n".join(results) if results else "No matching memories found."
-
-    return f"Unknown tool: {name}"
+def run_bash(command: str) -> str:
+    if needs_approval(command):
+        print(f"\n  ⚠️  {command}")
+        answer = input("  Run? (y/n): ").strip().lower()
+        if answer != "y":
+            return "Cancelled by user."
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=60,
+            executable="/bin/bash",
+        )
+        output = result.stdout + result.stderr
+        return output if output else "(no output)"
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 60 seconds."
+    except Exception as e:
+        return f"Error: {e}"
 
 
 # ─── Session Management ───────────────────────────────────────────────────────
 
 
-def get_session_path(session_key):
-    """Return the filesystem path for a session key."""
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
+def get_session_path(session_key: str) -> Path:
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     safe_key = session_key.replace(":", "_").replace("/", "_")
-    return os.path.join(SESSIONS_DIR, f"{safe_key}.jsonl")
+    return SESSIONS_DIR / f"{safe_key}.jsonl"
 
 
-def load_session(session_key):
-    """Load all messages from a session file."""
+def load_session(session_key: str) -> list:
     path = get_session_path(session_key)
     messages = []
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            for line in f:
-                if line.strip():
-                    try:
-                        messages.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if line.strip():
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
     return messages
 
 
-def append_message(session_key, message):
-    """Append one message to a session file."""
-    with open(get_session_path(session_key), "a") as f:
+def append_message(session_key: str, message: dict) -> None:
+    with get_session_path(session_key).open("a") as f:
         f.write(json.dumps(message) + "\n")
 
 
-def save_session(session_key, messages):
-    """Overwrite a session file with a full message list."""
-    with open(get_session_path(session_key), "w") as f:
+def save_session(session_key: str, messages: list) -> None:
+    with get_session_path(session_key).open("w") as f:
         for msg in messages:
             f.write(json.dumps(msg) + "\n")
 
@@ -298,13 +140,11 @@ def save_session(session_key, messages):
 # ─── Context Compaction ───────────────────────────────────────────────────────
 
 
-def estimate_tokens(messages):
-    """Rough token estimate (~4 chars per token)."""
+def estimate_tokens(messages: list) -> int:
     return sum(len(json.dumps(m)) for m in messages) // 4
 
 
-def compact_session(session_key, messages):
-    """Summarize older messages if the session is too long."""
+def compact_session(session_key: str, messages: list) -> list:
     if estimate_tokens(messages) < 100_000:
         return messages
     split = len(messages) // 2
@@ -314,36 +154,29 @@ def compact_session(session_key, messages):
     response = client.chat.completions.create(
         model=DEFAULT_MODEL,
         max_tokens=2000,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Summarize this conversation concisely. Preserve key facts, "
-                    "decisions, and open tasks:\n\n"
-                    f"{json.dumps(old, indent=2)}"
-                ),
-            }
-        ],
+        messages=[{
+            "role": "user",
+            "content": (
+                "Summarize this coding session concisely. Preserve key decisions, "
+                "files changed, and open tasks:\n\n"
+                f"{json.dumps(old, indent=2)}"
+            ),
+        }],
     )
-    summary_text = response.choices[0].message.content or ""
-    compacted = [
-        {"role": "user", "content": f"[Conversation summary]\n{summary_text}"}
-    ] + recent
+    summary = response.choices[0].message.content or ""
+    compacted = [{"role": "user", "content": f"[Session summary]\n{summary}"}] + recent
     save_session(session_key, compacted)
     return compacted
 
 
-# ─── Command Queue (per-session locks) ────────────────────────────────────────
-
-session_locks = defaultdict(threading.Lock)
-
 # ─── Agent Loop ───────────────────────────────────────────────────────────────
 
+session_locks: dict = defaultdict(threading.Lock)
 
-def run_agent_turn(session_key, user_text, agent_config):
-    """Run a full agent turn: load session, call LLM in a loop, save."""
+
+def run_agent_turn(session_key: str, user_text: str) -> str:
     client = OpenAI(base_url=BASE_URL, api_key="not-needed")
-    system_msg = {"role": "system", "content": agent_config["soul"]}
+    system_msg = {"role": "system", "content": SYSTEM_PROMPT}
 
     with session_locks[session_key]:
         messages = load_session(session_key)
@@ -353,9 +186,9 @@ def run_agent_turn(session_key, user_text, agent_config):
         messages.append(user_msg)
         append_message(session_key, user_msg)
 
-        for _ in range(20):  # safety limit for tool loops
+        for _ in range(20):
             response = client.chat.completions.create(
-                model=agent_config["model"],
+                model=DEFAULT_MODEL,
                 max_tokens=4096,
                 tools=TOOLS,
                 messages=[system_msg] + messages,
@@ -364,16 +197,13 @@ def run_agent_turn(session_key, user_text, agent_config):
             choice = response.choices[0]
             msg = choice.message
 
-            assistant_msg = {"role": "assistant", "content": msg.content or ""}
+            assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
             if msg.tool_calls:
                 assistant_msg["tool_calls"] = [
                     {
                         "id": tc.id,
                         "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                     }
                     for tc in msg.tool_calls
                 ]
@@ -386,16 +216,16 @@ def run_agent_turn(session_key, user_text, agent_config):
 
             if choice.finish_reason == "tool_calls":
                 for tc in msg.tool_calls:
-                    name = tc.function.name
-                    tool_input = json.loads(tc.function.arguments)
-                    print(f"  🔧 {name}: {tc.function.arguments[:100]}")
-                    result = execute_tool(name, tool_input)
-                    print(f"     → {str(result)[:150]}")
+                    args = json.loads(tc.function.arguments)
+                    command = args.get("command", "")
+                    print(f"  $ {command}")
+                    result = run_bash(command)
+                    print(f"  {result[:200].strip()}")
 
                     tool_msg = {
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": str(result),
+                        "content": result,
                     }
                     messages.append(tool_msg)
                     append_message(session_key, tool_msg)
@@ -403,83 +233,39 @@ def run_agent_turn(session_key, user_text, agent_config):
         return "(max turns reached)"
 
 
-# ─── Multi‑Agent Routing ──────────────────────────────────────────────────────
-
-
-def resolve_agent(message_text):
-    """Route messages to the right agent based on prefix commands."""
-    if message_text.startswith("/research "):
-        return "researcher", message_text[len("/research ") :]
-    return "main", message_text
-
-
-# ─── Cron / Heartbeats ────────────────────────────────────────────────────────
-
-
-def setup_heartbeats():
-    """Start the scheduler in a background thread."""
-
-    def morning_check():
-        print("\n⏰ Heartbeat: morning check")
-        result = run_agent_turn(
-            "cron:morning-check",
-            "Good morning! Check today's date and give me a motivational quote.",
-            AGENTS["main"],
-        )
-        print(f"🤖 {result}\n")
-
-    schedule.every().day.at("07:30").do(morning_check)
-
-    def scheduler_loop():
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-
-
-# ─── REPL Main ────────────────────────────────────────────────────────────────
+# ─── REPL ─────────────────────────────────────────────────────────────────────
 
 
 def main():
-    for d in [WORKSPACE, SESSIONS_DIR, MEMORY_DIR]:
-        os.makedirs(d, exist_ok=True)
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
-    setup_heartbeats()
-
-    session_key = "agent:main:repl"
-    print("Mini OpenClaw")
-    print(f"  Agents: {', '.join(a['name'] for a in AGENTS.values())}")
+    session_key = "coding:repl"
+    print("mini-me coding agent")
+    print(f"  Model:     {DEFAULT_MODEL}")
+    print(f"  Endpoint:  {BASE_URL}")
     print(f"  Workspace: {WORKSPACE}")
-    print("  Commands: /new (reset), /research <query>, /quit\n")
+    print("  Commands:  /new  /quit\n")
 
     while True:
         try:
             user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
+            print("\nBye!")
             break
 
         if not user_input:
             continue
         if user_input.lower() in ["/quit", "/exit", "/q"]:
-            print("Goodbye!")
+            print("Bye!")
             break
         if user_input.lower() == "/new":
-            session_key = f"agent:main:repl:{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            session_key = f"coding:repl:{datetime.now().strftime('%Y%m%d%H%M%S')}"
             print("  Session reset.\n")
             continue
 
-        agent_id, message_text = resolve_agent(user_input)
-        agent_config = AGENTS[agent_id]
-        sk = (
-            f"{agent_config['session_prefix']}:repl"
-            if agent_id != "main"
-            else session_key
-        )
-
-        response = run_agent_turn(sk, message_text, agent_config)
-        print(f"\n🤖 [{agent_config['name']}] {response}\n")
+        response = run_agent_turn(session_key, user_input)
+        print(f"\n🤖 {response}\n")
 
 
 if __name__ == "__main__":
