@@ -8,13 +8,33 @@
 mini-me.py - A TDD coding agent orchestrated by the app.
 """
 
+import contextlib
 import json
 import re
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 
 from openai import OpenAI
+
+# ─── Colors ────────────────────────────────────────────────────────────────────
+
+class C:
+    RESET  = "\033[0m"
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    RED    = "\033[31m"
+    GREEN  = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN   = "\033[36m"
+
+def header(msg: str)-> str: return f"{C.BOLD}{C.CYAN}{msg}{C.RESET}"
+def step(msg: str)  -> str: return f"{C.CYAN}{msg}{C.RESET}"
+def metric(msg: str)-> str: return f"{C.DIM}{msg}{C.RESET}"
+def ok(msg: str)    -> str: return f"{C.GREEN}{msg}{C.RESET}"
+def err(msg: str)   -> str: return f"{C.RED}{msg}{C.RESET}"
+def cmd(msg: str)   -> str: return f"{C.DIM}{msg}{C.RESET}"
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 
@@ -22,8 +42,8 @@ WORKSPACE = Path.cwd() / ".mini-me"
 SESSIONS_DIR = WORKSPACE / "sessions"
 MEMORY_DIR = WORKSPACE / "memory"
 
-BASE_URL = "http://127.0.0.1:8080/v1"
-DEFAULT_MODEL = "local-model"
+BASE_URL = "http://localhost:2276/v1"
+DEFAULT_MODEL = "qwen3-4b"
 
 SYSTEM_PROMPT = f"""\
 You are a coding agent. Your only tool is bash — use it for everything.
@@ -191,12 +211,23 @@ def agent_turn(client: OpenAI, session_key: str, prompt: str) -> str:
     system_msg = {"role": "system", "content": SYSTEM_PROMPT}
 
     while True:
-        response = client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            max_tokens=4096,
-            tools=TOOLS,
-            messages=[system_msg] + messages,
-        )
+        # Retry API call on transient errors
+        for attempt in range(5):
+            try:
+                response = client.chat.completions.create(
+                    model=DEFAULT_MODEL,
+                    max_tokens=4096,
+                    tools=TOOLS,
+                    messages=[system_msg] + messages,
+                )
+                break
+            except Exception as e:
+                if attempt == 4:
+                    raise
+                wait = 2 ** attempt
+                print(f"  API error ({e}) — retrying in {wait}s")
+                time.sleep(wait)
+
         choice = response.choices[0]
         msg = choice.message
 
@@ -218,15 +249,44 @@ def agent_turn(client: OpenAI, session_key: str, prompt: str) -> str:
 
         if choice.finish_reason == "tool_calls":
             for tc in msg.tool_calls:
-                args = json.loads(tc.function.arguments)
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
                 command = args.get("command", "")
-                print(f"    $ {command}")
-                output = run_bash(command)
-                print(f"    {output[:300].strip()}")
+                print(cmd(f"    $ {command}"))
+                output = run_bash(command) if command else "(empty command)"
+                print(cmd(f"    {output[:300].strip()}"))
 
                 tool_msg = {"role": "tool", "tool_call_id": tc.id, "content": output}
                 messages.append(tool_msg)
                 append_message(session_key, tool_msg)
+
+
+# ─── Timing ───────────────────────────────────────────────────────────────────
+
+_timings: list[tuple[str, float]] = []
+
+
+@contextlib.contextmanager
+def timed(label: str):
+    start = time.perf_counter()
+    yield
+    elapsed = time.perf_counter() - start
+    _timings.append((label, elapsed))
+    print(metric(f"  ⏱  {label}: {elapsed:.1f}s"))
+
+
+def print_summary() -> None:
+    if not _timings:
+        return
+    total = sum(t for _, t in _timings)
+    print(metric("\n── Timing summary"))
+    for label, elapsed in _timings:
+        pct = elapsed / total * 100
+        print(metric(f"  {elapsed:6.1f}s  {pct:4.0f}%  {label}"))
+    print(metric(f"  {'─'*30}"))
+    print(metric(f"  {total:6.1f}s  total"))
 
 
 # ─── TDD orchestration ─────────────────────────────────────────────────────────
@@ -244,7 +304,11 @@ def parse_tasks(response: str) -> list[str]:
 def extract_test_command(response: str) -> str:
     """Parse TEST_COMMAND: <cmd> from the agent's test-writing response."""
     m = re.search(r"TEST_COMMAND:\s*(.+)", response)
-    return m.group(1).strip() if m else ""
+    if not m:
+        return ""
+    # Normalize all Unicode whitespace variants (non-breaking spaces, thin spaces, etc.)
+    # to plain ASCII spaces so bash tokenises the command correctly.
+    return " ".join(m.group(1).strip().split())
 
 
 def update_plan(tasks: list[str], current: int, status: str) -> None:
@@ -261,19 +325,22 @@ def update_plan(tasks: list[str], current: int, status: str) -> None:
 
 
 def tdd_cycle(client: OpenAI, session_key: str, requirement: str) -> None:
+    _timings.clear()
+
     # ── Planning ──────────────────────────────────────────────────────────────
-    print("\n── Planning")
-    plan_response = agent_turn(
-        client, session_key,
-        f"First, inspect the project to determine:\n"
-        f"  1. The implementation language\n"
-        f"  2. The test framework and its test discovery conventions (file names, directories)\n"
-        f"  3. The command to run the full test suite\n"
-        f"Save this to {MEMORY_DIR}/project.md, then decompose the requirement below "
-        f"into atomic tasks, each small enough to be implemented and tested in isolation.\n\n"
-        f"Output a numbered list only — one task per line, no other text.\n\n"
-        f"Requirement: {requirement}"
-    )
+    print(header("\n── Planning"))
+    with timed("planning"):
+        plan_response = agent_turn(
+            client, session_key,
+            f"First, inspect the project to determine:\n"
+            f"  1. The implementation language\n"
+            f"  2. The test framework and its test discovery conventions (file names, directories)\n"
+            f"  3. The command to run the full test suite\n"
+            f"Save this to {MEMORY_DIR}/project.md, then decompose the requirement below "
+            f"into atomic tasks, each small enough to be implemented and tested in isolation.\n\n"
+            f"Output a numbered list only — one task per line, no other text.\n\n"
+            f"Requirement: {requirement}"
+        )
     tasks = parse_tasks(plan_response)
     if not tasks:
         print("  Agent did not return a parseable task list.")
@@ -281,57 +348,66 @@ def tdd_cycle(client: OpenAI, session_key: str, requirement: str) -> None:
         return
 
     update_plan(tasks, -1, " ")
-    print(f"  {len(tasks)} tasks planned")
+    print(step(f"  {len(tasks)} tasks planned"))
     for i, t in enumerate(tasks, 1):
-        print(f"    {i}. {t}")
+        print(step(f"    {i}. {t}"))
 
     # ── Per-task TDD loop ─────────────────────────────────────────────────────
     for i, task in enumerate(tasks):
-        print(f"\n── Task {i + 1}/{len(tasks)}: {task}")
+        print(header(f"\n── Task {i + 1}/{len(tasks)}: {task}"))
         update_plan(tasks, i, "~")
 
         # ── Step 1: Write test ────────────────────────────────────────────────
-        print("  Step 1: Write test")
+        print(step("  Step 1: Write test"))
         test_cmd = ""
+        attempt = 0
         while True:
-            response = agent_turn(
-                client, session_key,
-                f"Task: {task}\n\n"
-                f"Write a failing test for this task and nothing else — no implementation code.\n"
-                f"The test must be written to the correct test file on disk following the "
-                f"project's language and framework conventions (check {MEMORY_DIR}/project.md).\n"
-                f"The test file must be discoverable and runnable by the project's test runner "
-                f"without any extra configuration.\n"
-                f"End your response with exactly:\n"
-                f"TEST_COMMAND: <the bash command to run only this test>"
-            )
+            attempt += 1
+            with timed(f"task {i+1} · write test (attempt {attempt})"):
+                response = agent_turn(
+                    client, session_key,
+                    f"Task: {task}\n\n"
+                    f"Write a failing test for this task and nothing else — no implementation code.\n"
+                    f"The test must be written to the correct test file on disk following the "
+                    f"project's language and framework conventions (check {MEMORY_DIR}/project.md).\n"
+                    f"The test file must be discoverable and runnable by the project's test runner "
+                    f"without any extra configuration.\n"
+                    f"End your response with exactly:\n"
+                    f"TEST_COMMAND: <the bash command to run only this test>"
+                )
             test_cmd = extract_test_command(response)
             if not test_cmd:
-                print("  No TEST_COMMAND found — asking agent to try again")
-                agent_turn(
-                    client, session_key,
-                    "Your response did not include a TEST_COMMAND line. "
-                    "Please provide the exact bash command to run the test, "
-                    "on its own line prefixed with TEST_COMMAND:"
-                )
+                print(err("  No TEST_COMMAND found — asking agent to clarify"))
+                with timed(f"task {i+1} · clarify TEST_COMMAND"):
+                    response = agent_turn(
+                        client, session_key,
+                        "Your response did not include a TEST_COMMAND line. "
+                        "Reply with only the exact bash command to run the test, "
+                        "on its own line prefixed with TEST_COMMAND:"
+                    )
+                test_cmd = extract_test_command(response)
+            if not test_cmd:
+                print(err("  Still no TEST_COMMAND — retrying from scratch"))
                 continue
 
-            print(f"  Running: {test_cmd}")
-            output, code = run_bash_with_code(test_cmd)
-            print(f"  Exit code: {code}")
+            print(step(f"  Running: {test_cmd}"))
+            with timed(f"task {i+1} · run test (red check)"):
+                output, code = run_bash_with_code(test_cmd)
+            print(metric(f"  Exit code: {code}"))
             print(f"  {output[:400].strip()}")
 
             if code != 0:
-                print("  ✓ Test is RED — correct")
+                print(ok("  ✓ Test is RED — correct"))
                 break
             else:
-                print("  ✗ Test passes before implementation — test is invalid, asking agent to fix")
-                agent_turn(
-                    client, session_key,
-                    f"The test passed before any implementation exists (exit 0):\n\n{output}\n\n"
-                    f"A test that passes before implementation is not a real test. "
-                    f"Fix the test so it fails for the correct reason, then end with TEST_COMMAND: <cmd>"
-                )
+                print(err("  ✗ Test passes before implementation — test is invalid, asking agent to fix"))
+                with timed(f"task {i+1} · fix invalid test"):
+                    agent_turn(
+                        client, session_key,
+                        f"The test passed before any implementation exists (exit 0):\n\n{output}\n\n"
+                        f"A test that passes before implementation is not a real test. "
+                        f"Fix the test so it fails for the correct reason, then end with TEST_COMMAND: <cmd>"
+                    )
 
         # Save progress after red test confirmed
         update_plan(tasks, i, "T")
@@ -339,26 +415,30 @@ def tdd_cycle(client: OpenAI, session_key: str, requirement: str) -> None:
                  f"task: {task}\nstatus: test-written\ntest_command: {test_cmd}\nEOF")
 
         # ── Step 2: Write implementation ──────────────────────────────────────
-        print("  Step 2: Implement")
+        print(step("  Step 2: Implement"))
         failure_output = output
+        impl_attempt = 0
         while True:
-            agent_turn(
-                client, session_key,
-                f"The test is failing:\n\n{failure_output}\n\n"
-                f"Write the minimum implementation to make this pass:\n"
-                f"  {test_cmd}\n\n"
-                f"Do not modify the test file."
-            )
-            print(f"  Running: {test_cmd}")
-            output, code = run_bash_with_code(test_cmd)
-            print(f"  Exit code: {code}")
+            impl_attempt += 1
+            with timed(f"task {i+1} · implement (attempt {impl_attempt})"):
+                agent_turn(
+                    client, session_key,
+                    f"The test is failing:\n\n{failure_output}\n\n"
+                    f"Write the minimum implementation to make this pass:\n"
+                    f"  {test_cmd}\n\n"
+                    f"Do not modify the test file."
+                )
+            print(step(f"  Running: {test_cmd}"))
+            with timed(f"task {i+1} · run test (green check)"):
+                output, code = run_bash_with_code(test_cmd)
+            print(metric(f"  Exit code: {code}"))
             print(f"  {output[:400].strip()}")
 
             if code == 0:
-                print("  ✓ Test is GREEN")
+                print(ok("  ✓ Test is GREEN"))
                 break
             else:
-                print("  ✗ Still failing — retrying implementation")
+                print(err("  ✗ Still failing — retrying implementation"))
                 failure_output = output
 
         # Save progress and accumulate test command
@@ -370,15 +450,17 @@ def tdd_cycle(client: OpenAI, session_key: str, requirement: str) -> None:
     update_plan(tasks, len(tasks), " ")
 
     # ── Regression run ────────────────────────────────────────────────────────
-    print("\n── Regression check")
-    regression_cmd_path = MEMORY_DIR / "project.md"
-    regression_response = agent_turn(
-        client, session_key,
-        f"All tasks are complete. Read {regression_cmd_path} and run the full test suite "
-        f"to confirm there are no regressions. Report which tests passed and which failed."
-    )
+    print(header("\n── Regression check"))
+    with timed("regression suite"):
+        regression_response = agent_turn(
+            client, session_key,
+            f"All tasks are complete. Read {MEMORY_DIR}/project.md and run the full test suite "
+            f"to confirm there are no regressions. Report which tests passed and which failed."
+        )
     print(f"  {regression_response.strip()}")
-    print("\n── All tasks complete")
+
+    print_summary()
+    print(ok("\n── All tasks complete"))
 
 
 # ─── REPL ─────────────────────────────────────────────────────────────────────
@@ -413,7 +495,12 @@ def main():
             print("  Session reset.\n")
             continue
 
-        tdd_cycle(client, session_key, user_input)
+        try:
+            tdd_cycle(client, session_key, user_input)
+        except KeyboardInterrupt:
+            print("\n  Interrupted.")
+        except Exception as e:
+            print(f"\n  Error: {e}")
 
 
 if __name__ == "__main__":
